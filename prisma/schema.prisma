@@ -1,0 +1,44 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "cockroachdb"
+  url      = env("DATABASE_URL")
+}
+
+model Company {
+  id          String   @id @default(cuid())
+  name        String
+  description String
+  phoneNumber String?  @unique
+  status      String   @default("DISCONNECTED")
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  conversations Conversation[]
+
+  @@map("companies")
+}
+
+model Conversation {
+  id            String   @id @default(cuid())
+  companyId     String
+  company       Company  @relation(fields: [companyId], references: [id])
+  senderPhone   String
+  senderName    String?  // Nombre del contacto
+  senderImage   String?  // URL de la imagen del contacto
+  companyPhone  String
+  messages      Json     // Array de mensajes
+  lastUpdated   DateTime @updatedAt
+  aiEnabled     Boolean  @default(false)
+  unreadCount   Int      @default(0)  // Contador de mensajes no leídos
+  lastRead      DateTime @default(now())  // Última vez que se leyó la conversación
+  contactInfo   Json?    // Información adicional del contacto (ocupación, estado, etc.)
+  status        String   @default("ACTIVE")
+  createdAt     DateTime @default(now())
+
+  @@index([companyId])
+  @@index([senderPhone])
+  @@map("conversations")
+}
