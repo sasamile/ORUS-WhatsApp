@@ -12,63 +12,20 @@ export default function WhatsAppConnectPage() {
   const [isConnected, setIsConnected] = useState(false)
   const [isLoading, setIsLoading] = useState(true)
   const [phoneNumber, setPhoneNumber] = useState<string | null>(null)
-  const [companyId, setCompanyId] = useState<string | null>(null)
   const [error, setError] = useState<string | null>(null)
   const router = useRouter()
 
   useEffect(() => {
-    // Obtener companyId del localStorage
-    const storedCompanyId = localStorage.getItem("companyId")
-    if (!storedCompanyId) {
-      console.error("No se encontró el ID de la compañía")
-      setError("No se encontró el ID de la compañía. Por favor, inicie sesión nuevamente.")
-      return
-    }
-    setCompanyId(storedCompanyId)
-  }, [])
-
-  useEffect(() => {
-    if (!companyId) return // No hacer nada si no hay companyId
-
-    const checkStatus = async () => {
-      try {
-        const response = await axios.get("/api/whatsapp/status")
-        const { connected, hasExistingSession, phoneNumber: statusPhoneNumber } = response.data
-
-        console.log("Estado de WhatsApp:", response.data)
-
-        // Solo considerar conectado si hay número de teléfono
-        if (connected && statusPhoneNumber) {
-          console.log("WhatsApp conectado con número:", statusPhoneNumber)
-          setIsConnected(true)
-          setPhoneNumber(statusPhoneNumber)
-          setIsLoading(false)
-          // Redirigir inmediatamente
-          router.push("/chat")
-          return
-        }
-
-        // Si no está conectado y no hay QR, inicializar
-        if (!qrCode && !isConnected) {
-          console.log("Iniciando conexión de WhatsApp...")
-          await initializeWhatsApp()
-        }
-      } catch (error) {
-        console.error("Error verificando estado:", error)
-        setError("Error al verificar el estado de WhatsApp")
-        setIsLoading(false)
-      }
-    }
-
-    checkStatus()
-  }, [companyId, router, qrCode, isConnected])
-
-  const initializeWhatsApp = async () => {
+    const companyId = localStorage.getItem("companyId")
     if (!companyId) {
       setError("No se encontró el ID de la compañía")
+      setIsLoading(false)
       return
     }
+    initializeWhatsApp(companyId)
+  }, [])
 
+  const initializeWhatsApp = async (companyId: string) => {
     try {
       setIsLoading(true)
       setError(null)
@@ -83,30 +40,28 @@ export default function WhatsAppConnectPage() {
 
       console.log("Respuesta de inicialización:", response.data)
 
-      // Solo considerar conectado si hay número de teléfono
       if (response.data.connected && response.data.phoneNumber) {
         console.log("WhatsApp conectado con número:", response.data.phoneNumber)
         setIsConnected(true)
         setPhoneNumber(response.data.phoneNumber)
-        setIsLoading(false)
         router.push("/chat")
       } else if (response.data.qrCode) {
         console.log("Código QR recibido, mostrando...")
         setQrCode(response.data.qrCode)
-        setIsLoading(false)
       } else {
         console.log("No se recibió código QR o número")
-        setIsLoading(false)
         setError("No se pudo generar el código QR. Intente nuevamente.")
       }
     } catch (error: any) {
       console.error("Error al inicializar WhatsApp:", error)
-      setError(error.response?.data?.message || "Error al conectar con WhatsApp")
+      setError(error.response?.data?.error || "Error al conectar con WhatsApp")
+    } finally {
       setIsLoading(false)
     }
   }
 
   const handleRetry = async () => {
+    const companyId = localStorage.getItem("companyId")
     if (!companyId) {
       setError("No se encontró el ID de la compañía")
       return
@@ -119,18 +74,15 @@ export default function WhatsAppConnectPage() {
       setIsConnected(false)
       setPhoneNumber(null)
       
-      // Limpiar todas las sesiones
+      // Limpiar sesión actual
       await axios.post("/api/whatsapp/clear-session")
-      await axios.post("/api/whatsapp/clear-all-sessions")
-      
-      // Esperar un momento para asegurar que las sesiones se limpien
-      await new Promise(resolve => setTimeout(resolve, 1000))
       
       // Reiniciar la conexión
-      await initializeWhatsApp()
+      await initializeWhatsApp(companyId)
     } catch (error: any) {
       console.error("Error al reintentar conexión:", error)
-      setError(error.response?.data?.message || "Error al reintentar la conexión")
+      setError(error.response?.data?.error || "Error al reintentar la conexión")
+    } finally {
       setIsLoading(false)
     }
   }

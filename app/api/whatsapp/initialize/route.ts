@@ -19,7 +19,7 @@ export async function POST(request: Request) {
     await new Promise(resolve => setTimeout(resolve, 2000))
     
     // Obtener el estado actual
-    const status = await whatsappService.getStatus()
+    const status = await whatsappService.getStatus(companyId)
     console.log("Estado de WhatsApp:", status)
     
     return NextResponse.json(status)

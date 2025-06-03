@@ -9,19 +9,23 @@ interface Message {
   direction: "in" | "out"
   timestamp: string
   isAI: boolean
+  imageUrl?: string | null
 }
 
 interface Conversation {
   id: string
-  senderPhone: string
-  senderName: string
-  senderImage: string
-  messages: Message[]
-  lastUpdated: string
-  aiEnabled: boolean
+  phoneNumber: string
+  name: string
+  lastMessage: string
+  lastMessageTime: string
   unreadCount: number
-  contactInfo: any
-  companyPhone: string
+  messages: Message[]
+  isAI: boolean
+  senderImage: string | null
+  aiEnabled: boolean
+  senderName: string
+  senderPhone: string
+  lastUpdated: string
 }
 
 export default function ChatPage() {
@@ -32,19 +36,21 @@ export default function ChatPage() {
   const [isLoading, setIsLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
   const [isRedirecting, setIsRedirecting] = useState(false)
-  const [phoneNumber, setPhoneNumber] = useState("")
+  const [phoneNumber, setPhoneNumber] = useState<string | null>(null)
+  const [isConnected, setIsConnected] = useState(false)
 
   // Referencias para el contenedor de mensajes
   const messagesEndRef = useRef<HTMLDivElement>(null)
   const chatContainerRef = useRef<HTMLDivElement>(null)
   const prevMessagesLengthRef = useRef<number>(0)
+  const wsRef = useRef<WebSocket | null>(null)
+  const reconnectTimeoutRef = useRef<NodeJS.Timeout | undefined>(undefined)
 
   // Función para verificar si el usuario está al final del chat
   const isAtBottom = () => {
     if (!chatContainerRef.current) return true
     const { scrollTop, scrollHeight, clientHeight } = chatContainerRef.current
-    const threshold = 50 // píxeles desde el final
-    return scrollHeight - scrollTop - clientHeight < threshold
+    return scrollHeight - scrollTop - clientHeight < 50
   }
 
   // Función para hacer scroll al último mensaje
@@ -71,151 +77,191 @@ export default function ChatPage() {
     }
   }, [selectedConversation?.messages])
 
-  useEffect(() => {
-    const checkConnection = async () => {
-      try {
-        const response = await fetch("/api/whatsapp/status")
-        const data = await response.json()
-        const hasSession = await data.hasExistingSession
+  const checkWhatsAppStatus = async () => {
+    try {
+      const companyId = localStorage.getItem("companyId")
+      if (!companyId) {
+        console.error("No se encontró companyId en localStorage")
+        router.replace("/whatsapp-connect")
+        return false
+      }
 
-        if (hasSession) {
-          console.log("Sesión existente encontrada, conectando...")
-          try {
-            const initResponse = await fetch("/api/whatsapp/initialize", {
-              method: "POST",
-              headers: {
-                "Content-Type": "application/json"
-              },
-              body: JSON.stringify({ companyId: localStorage.getItem("companyId") })
-            })
-            const initData = await initResponse.json()
-            
-            if (initData.connected) {
-              console.log("Conexión exitosa")
-              setPhoneNumber(initData.phoneNumber)
-              loadConversations()
-              return
-            }
-          } catch (error) {
-            console.error("Error al conectar:", error)
-          }
-        }
-
-        if (!hasSession) {
-          console.log("No hay sesión activa, redirigiendo...")
-          router.replace("/whatsapp-connect")
-          return
-        }
-
-        setPhoneNumber(data.phoneNumber)
-        loadConversations()
-      } catch (error) {
-        console.error("Error verificando conexión:", error)
-        const statusResponse = await fetch("/api/whatsapp/status")
-        const statusData = await statusResponse.json()
-        const hasSession = await statusData.hasExistingSession
+      console.log("Verificando estado de WhatsApp para companyId:", companyId)
+      const status = await axios.get("/api/whatsapp/status", { params: { companyId } }).then(res => res.data)
+      console.log('Estado de WhatsApp:', status)
+      
+      if (!status.connected) {
+        console.log('WhatsApp no está conectado, intentando reconectar...')
+        const reconnectResult = await axios.post("/api/whatsapp/connect", { companyId }).then(res => res.data)
+        console.log('Resultado de reconexión:', reconnectResult)
         
-        if (!hasSession) {
-          router.replace("/whatsapp-connect")
+        if (!reconnectResult.connected) {
+          setError('No se pudo conectar con WhatsApp. Por favor, intente nuevamente.')
+          return false
         }
       }
+      
+      setIsConnected(true)
+      setPhoneNumber(status.phoneNumber)
+      await loadConversations()
+      return true
+    } catch (error) {
+      console.error('Error verificando estado de WhatsApp:', error)
+      setError('Error al verificar el estado de WhatsApp')
+      return false
     }
+  }
 
-    checkConnection()
-    // Verificar conexión cada 30 segundos
-    const connectionInterval = setInterval(checkConnection, 30000)
-    return () => clearInterval(connectionInterval)
+  useEffect(() => {
+    checkWhatsAppStatus()
   }, [router])
 
-  useEffect(() => {
-    loadConversations()
-    // Actualizar conversaciones cada 5 segundos
-    const interval = setInterval(loadConversations, 5000)
-    return () => clearInterval(interval)
-  }, [])
-
-  // Configurar WebSocket para actualizaciones en tiempo real
-  useEffect(() => {
-    let ws: WebSocket | null = null
-    let reconnectTimeout: NodeJS.Timeout
-
-    const setupWebSocket = () => {
-      try {
-        // Obtener la URL base del servidor
-        const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:'
-        const wsUrl = `${protocol}//${window.location.host}/ws`
-        
-        console.log("Intentando conectar WebSocket a:", wsUrl)
-        
-        // Cerrar conexión existente si hay una
-        if (ws) {
-          ws.close()
-        }
-
-        ws = new WebSocket(wsUrl)
-        
-        ws.onopen = () => {
-          console.log("WebSocket conectado exitosamente")
-          // Limpiar cualquier timeout de reconexión pendiente
-          if (reconnectTimeout) {
-            clearTimeout(reconnectTimeout)
-          }
-        }
-        
-        ws.onmessage = (event) => {
-          try {
-            const data = JSON.parse(event.data)
-            console.log("Mensaje WebSocket recibido:", data)
-            
-            if (data && data.conversationId) {
-              console.log("Actualizando conversación:", data.conversationId)
-              updateConversation(data.conversationId)
-            }
-          } catch (error) {
-            console.error("Error procesando mensaje WebSocket:", error)
-          }
-        }
-
-        ws.onerror = (error) => {
-          console.error("Error en WebSocket:", error)
-          // Intentar reconectar en caso de error
-          if (ws) {
-            ws.close()
-          }
-        }
-
-        ws.onclose = (event) => {
-          console.log("WebSocket cerrado:", event.code, event.reason)
-          // Intentar reconectar después de 2 segundos
-          reconnectTimeout = setTimeout(setupWebSocket, 2000)
-        }
-
-      } catch (error) {
-        console.error("Error configurando WebSocket:", error)
-        // Intentar reconectar después de 2 segundos
-        reconnectTimeout = setTimeout(setupWebSocket, 2000)
-      }
+  const loadConversations = async () => {
+    if (isRedirecting) {
+      console.log("No se cargan conversaciones - isRedirecting:", isRedirecting)
+      return
     }
 
-    // Iniciar la conexión
-    setupWebSocket()
-
-    // Limpiar al desmontar
-    return () => {
-      if (reconnectTimeout) {
-        clearTimeout(reconnectTimeout)
+    try {
+      const companyId = localStorage.getItem("companyId")
+      if (!companyId) {
+        console.error("No se encontró companyId en localStorage")
+        setError("No se encontró el ID de la compañía")
+        setIsLoading(false)
+        return
       }
-      if (ws) {
-        ws.close()
+
+      console.log("Cargando conversaciones para companyId:", companyId)
+      const response = await axios.get("/api/conversations", {
+        params: { companyId }
+      })
+
+      console.log("Respuesta de conversaciones:", response.data)
+      
+      // Asegurarnos de que conversations sea un array
+      const conversationsData = Array.isArray(response.data) ? response.data : 
+                              Array.isArray(response.data.conversations) ? response.data.conversations : []
+      
+      console.log("Conversaciones procesadas:", conversationsData)
+      setConversations(conversationsData)
+
+      if (conversationsData.length > 0 && !selectedConversation) {
+        setSelectedConversation(conversationsData[0])
+      }
+      
+      setIsLoading(false)
+    } catch (error) {
+      console.error("Error cargando conversaciones:", error)
+      setError("Error al cargar las conversaciones")
+      setConversations([]) // Asegurar que conversations sea un array vacío en caso de error
+      setIsLoading(false)
+    }
+  }
+
+  const handleConnectClick = () => {
+    setIsRedirecting(true)
+    router.push("/whatsapp-connect")
+  }
+
+  // Función para enviar mensaje
+  const sendMessage = async () => {
+    if (!message.trim() || !selectedConversation) {
+      console.log('No se puede enviar el mensaje: mensaje vacío o sin conversación seleccionada')
+      return
+    }
+
+    const companyId = localStorage.getItem('companyId')
+    if (!companyId) {
+      setError('No se encontró el ID de la empresa')
+      return
+    }
+
+    try {
+      // Verificar que el número de teléfono exista
+      if (!selectedConversation.senderPhone) {
+        setError('Número de teléfono no disponible')
+        return
+      }
+
+      // Asegurar que el número de teléfono tenga el formato correcto
+      const phoneNumber = selectedConversation.senderPhone.replace(/\D/g, '')
+      if (!phoneNumber) {
+        setError('Número de teléfono inválido')
+        return
+      }
+
+      // Verificar estado de WhatsApp
+      const status = await axios.get("/api/whatsapp/status", { params: { companyId } }).then(res => res.data)
+      console.log('Estado de WhatsApp:', status)
+
+      if (!status.connected) {
+        console.log('WhatsApp no está conectado, intentando reconectar...')
+        const reconnectResult = await axios.post("/api/whatsapp/connect", { companyId }).then(res => res.data)
+        console.log('Resultado de reconexión:', reconnectResult)
+        
+        if (!reconnectResult.connected) {
+          setError('No se pudo conectar con WhatsApp. Por favor, intente nuevamente.')
+          return
+        }
+      }
+
+      // Enviar mensaje a través del endpoint de WhatsApp
+      const messageData = {
+        to: phoneNumber,
+        message: message.trim(),
+        companyId
+      }
+
+      console.log('Enviando mensaje:', messageData)
+      const response = await axios.post('/api/whatsapp/send', messageData)
+      
+      if (response.data.success) {
+        setMessage('')
+        // Actualizar la conversación después de enviar el mensaje
+        await updateConversation(selectedConversation.id)
+      } else {
+        setError('Error al enviar el mensaje')
+      }
+
+    } catch (error) {
+      console.error('Error completo:', error)
+      if (axios.isAxiosError(error)) {
+        const errorMessage = error.response?.data?.error || error.message
+        console.error('Error al enviar mensaje:', errorMessage)
+        setError(`Error al enviar mensaje: ${errorMessage}`)
+      } else {
+        setError('Error al enviar el mensaje')
       }
     }
-  }, []) // Sin dependencias para evitar reconexiones innecesarias
+  }
+
+  const markAsRead = async (conversationId: string) => {
+    try {
+      await axios.post("/api/conversations/mark-read", { conversationId })
+      updateConversation(conversationId)
+    } catch (error) {
+      console.error("Error marcando como leído:", error)
+    }
+  }
 
   // Función para actualizar una conversación específica
   const updateConversation = async (conversationId: string) => {
     try {
       console.log("Solicitando actualización de conversación:", conversationId)
+      
+      // Verificar que el ID de la conversación sea válido
+      if (!conversationId) {
+        console.error("ID de conversación inválido")
+        return
+      }
+
       const response = await axios.get(`/api/conversations/${conversationId}`)
+      
+      if (!response.data || !response.data.conversation) {
+        console.error("Respuesta inválida del servidor:", response.data)
+        return
+      }
+
       const updatedConversation = response.data.conversation
       console.log("Conversación actualizada recibida:", updatedConversation)
 
@@ -236,6 +282,14 @@ export default function ChatPage() {
       }
     } catch (error) {
       console.error("Error actualizando conversación:", error)
+      if (axios.isAxiosError(error)) {
+        console.error("Detalles del error:", {
+          status: error.response?.status,
+          data: error.response?.data,
+          message: error.message
+        })
+      }
+      // No actualizamos el estado en caso de error para mantener la UI estable
     }
   }
 
@@ -250,124 +304,12 @@ export default function ChatPage() {
     }
   }, [selectedConversation?.id])
 
-  const loadConversations = async () => {
-    if (isRedirecting) return
-
-    try {
-      console.log("Cargando conversaciones...")
-      
-      const statusResponse = await axios.get("/api/whatsapp/status")
-      const hasSession = await statusResponse.data.hasExistingSession
-      const isConnected = statusResponse.data.connected
-
-      if (!hasSession) {
-        console.log("No hay sesión activa, redirigiendo...")
-        setIsRedirecting(true)
-        router.push("/whatsapp-connect")
-        return
-      }
-
-      if (!isConnected && hasSession) {
-        console.log("Reconectando...")
-        try {
-          const initResponse = await axios.post("/api/whatsapp/initialize", {
-            companyId: localStorage.getItem("companyId")
-          })
-          
-          if (initResponse.data.connected) {
-            console.log("Reconexión exitosa")
-            setPhoneNumber(initResponse.data.phoneNumber)
-          } else {
-            console.log("Esperando reconexión...")
-            return
-          }
-        } catch (error) {
-          console.error("Error al reconectar:", error)
-          return
-        }
-      }
-
-      const response = await axios.get("/api/conversations")
-      
-      if (response.data.error) {
-        console.error("Error cargando conversaciones:", response.data.error)
-        return
-      }
-
-      // Ordenar conversaciones por fecha de último mensaje
-      const sortedConversations = response.data.conversations.sort((a: Conversation, b: Conversation) => 
-        new Date(b.lastUpdated).getTime() - new Date(a.lastUpdated).getTime()
-      )
-
-      setConversations(sortedConversations)
-
-      // Si no hay conversación seleccionada y hay conversaciones, seleccionar la más reciente
-      if (!selectedConversation && sortedConversations.length > 0) {
-        setSelectedConversation(sortedConversations[0])
-        if (sortedConversations[0].unreadCount > 0) {
-          markAsRead(sortedConversations[0].id)
-        }
-      } else if (selectedConversation) {
-        // Actualizar la conversación seleccionada si existe
-        const updatedSelected = sortedConversations.find(
-          (conv: Conversation) => conv.id === selectedConversation.id
-        )
-        if (updatedSelected) {
-          setSelectedConversation(updatedSelected)
-        }
-      }
-
-      setError(null)
-      setIsLoading(false)
-    } catch (error) {
-      console.error("Error cargando conversaciones:", error)
-      setIsLoading(false)
-    }
-  }
-
-  const handleConnectClick = () => {
-    setIsRedirecting(true)
-    router.push("/whatsapp-connect")
-  }
-
-  // Función para enviar mensaje
-  const sendMessage = async () => {
-    if (!message.trim() || !selectedConversation) return
-
-    try {
-      const response = await axios.post("/api/whatsapp/send", {
-        to: selectedConversation.senderPhone,
-        message: message.trim()
-      })
-
-      // Actualizar la conversación inmediatamente
-      if (response.data.conversationId) {
-        updateConversation(response.data.conversationId)
-        scrollToBottom() // Scroll al enviar mensaje
-      }
-
-      setMessage("")
-    } catch (error) {
-      console.error("Error enviando mensaje:", error)
-      setError("Error al enviar el mensaje")
-    }
-  }
-
-  const markAsRead = async (conversationId: string) => {
-    try {
-      await axios.post("/api/conversations/mark-read", { conversationId })
-      updateConversation(conversationId)
-    } catch (error) {
-      console.error("Error marcando como leído:", error)
-    }
-  }
-
   if (isLoading) {
     return (
       <div className="flex items-center justify-center min-h-screen">
         <div className="text-center">
           <div className="animate-spin rounded-full h-12 w-12 border-b-2 border-blue-500 mx-auto"></div>
-          <p className="mt-4 text-gray-600">Cargando conversaciones...</p>
+          <p className="mt-4 text-gray-600">Cargando...</p>
         </div>
       </div>
     )
@@ -379,10 +321,10 @@ export default function ChatPage() {
         <div className="text-center">
           <p className="text-red-500 mb-4">{error}</p>
           <button
-            onClick={handleConnectClick}
+            onClick={() => window.location.reload()}
             className="bg-blue-500 text-white px-4 py-2 rounded hover:bg-blue-600"
           >
-            Conectar WhatsApp
+            Reintentar
           </button>
         </div>
       </div>
@@ -391,121 +333,220 @@ export default function ChatPage() {
 
   return (
     <div className="flex h-screen bg-gray-100">
-      {/* Lista de conversaciones */}
-      <div className="w-1/3 border-r bg-white">
-        <div className="p-4 border-b">
-          <h2 className="text-xl font-semibold">Conversaciones</h2>
-        </div>
-        <div className="overflow-y-auto h-[calc(100vh-4rem)] scrollbar-thin scrollbar-thumb-gray-300 scrollbar-track-transparent">
-          {conversations.map((conv) => (
-            <div
-              key={conv.id}
+      {/* Sidebar */}
+      <div className="w-1/4 bg-white border-r shadow-lg">
+        <div className="p-4 border-b bg-gradient-to-r from-blue-600 to-blue-700 text-white">
+          <div className="flex items-center justify-between mb-2">
+            <h2 className="text-xl font-semibold">Conversaciones</h2>
+            <button
               onClick={() => {
-                setSelectedConversation(conv)
-                if (conv.unreadCount > 0) {
-                  markAsRead(conv.id)
+                const newValue = !selectedConversation?.aiEnabled
+                if (selectedConversation) {
+                  axios.post(`/api/conversations/${selectedConversation.id}/toggle-ai`, {
+                    aiEnabled: newValue
+                  }).then(() => {
+                    updateConversation(selectedConversation.id)
+                  })
                 }
               }}
-              className={`p-4 border-b cursor-pointer hover:bg-gray-50 ${
-                selectedConversation?.id === conv.id ? "bg-blue-50" : ""
+              className={`px-3 py-1 rounded-full text-sm font-medium transition-colors duration-200 ${
+                selectedConversation?.aiEnabled
+                  ? "bg-green-500 hover:bg-green-600"
+                  : "bg-gray-500 hover:bg-gray-600"
               }`}
             >
-              <div className="flex items-center">
-                <img
-                  src={conv.senderImage || "/default-avatar.png"}
-                  alt={conv.senderName}
-                  className="w-12 h-12 rounded-full mr-3"
-                />
-                <div className="flex-1">
-                  <div className="flex justify-between items-center">
-                    <h3 className="font-medium">{conv.senderName || conv.senderPhone}</h3>
-                    {conv.unreadCount > 0 && (
-                      <span className="bg-blue-500 text-white text-xs px-2 py-1 rounded-full">
-                        {conv.unreadCount}
+              {selectedConversation?.aiEnabled ? "IA Activada" : "IA Desactivada"}
+            </button>
+          </div>
+          <p className="text-sm text-blue-100">Número: {phoneNumber}</p>
+        </div>
+        <div className="overflow-y-auto h-[calc(100vh-80px)]">
+          {Array.isArray(conversations) && conversations.length > 0 ? (
+            conversations.map((conversation) => (
+              <div
+                key={conversation.id}
+                className={`p-4 border-b cursor-pointer hover:bg-gray-50 transition-colors duration-200 ${
+                  selectedConversation?.id === conversation.id ? "bg-blue-50 border-l-4 border-blue-500" : ""
+                }`}
+                onClick={() => {
+                  setSelectedConversation(conversation)
+                  if (conversation.unreadCount > 0) {
+                    markAsRead(conversation.id)
+                  }
+                }}
+              >
+                <div className="flex items-center space-x-3">
+                  {conversation.senderImage ? (
+                    <img 
+                      src={conversation.senderImage} 
+                      alt={conversation.senderName || conversation.senderPhone}
+                      className="w-12 h-12 rounded-full object-cover ring-2 ring-blue-500"
+                    />
+                  ) : (
+                    <div className="w-12 h-12 rounded-full bg-gradient-to-br from-blue-400 to-blue-600 flex items-center justify-center ring-2 ring-blue-500">
+                      <span className="text-white font-semibold text-lg">
+                        {(conversation.senderName || conversation.senderPhone).charAt(0).toUpperCase()}
+                      </span>
+                    </div>
+                  )}
+                  <div className="flex-1 min-w-0">
+                    <div className="flex justify-between items-start">
+                      <div className="flex items-center space-x-2">
+                        <p className="font-medium text-gray-900 truncate">
+                          {conversation.senderName || conversation.senderPhone}
+                        </p>
+                        {conversation.aiEnabled && (
+                          <span className="px-2 py-0.5 bg-green-100 text-green-800 text-xs rounded-full">
+                            IA
+                          </span>
+                        )}
+                      </div>
+                      <span className="text-xs text-gray-500">
+                        {new Date(conversation.lastUpdated).toLocaleTimeString()}
+                      </span>
+                    </div>
+                    <p className="text-sm text-gray-500 truncate">
+                      {conversation.messages?.[conversation.messages.length - 1]?.content || "Sin mensajes"}
+                    </p>
+                    {conversation.unreadCount > 0 && (
+                      <span className="inline-flex items-center justify-center px-2 py-1 text-xs font-bold leading-none text-white transform translate-y-1/2 bg-blue-600 rounded-full">
+                        {conversation.unreadCount}
                       </span>
                     )}
                   </div>
-                  <p className="text-sm text-gray-500 truncate">
-                    {conv.messages[conv.messages.length - 1]?.content || "Sin mensajes"}
-                  </p>
                 </div>
               </div>
+            ))
+          ) : (
+            <div className="p-8 text-center text-gray-500">
+              <svg className="w-16 h-16 mx-auto text-gray-400 mb-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M8 12h.01M12 12h.01M16 12h.01M21 12c0 4.418-4.03 8-9 8a9.863 9.863 0 01-4.255-.949L3 20l1.395-3.72C3.512 15.042 3 13.574 3 12c0-4.418 4.03-8 9-8s9 3.582 9 8z" />
+              </svg>
+              <p className="text-lg font-medium">No hay conversaciones disponibles</p>
+              <p className="text-sm mt-2">Los mensajes aparecerán aquí cuando recibas uno nuevo</p>
             </div>
-          ))}
+          )}
         </div>
       </div>
 
-      {/* Área de chat */}
-      <div className="flex-1 flex flex-col">
+      {/* Chat area */}
+      <div className="flex-1 flex flex-col bg-gray-50">
         {selectedConversation ? (
           <>
-            <div className="p-4 border-b bg-white">
-              <div className="flex items-center">
-                <img
-                  src={selectedConversation.senderImage || "/default-avatar.png"}
-                  alt={selectedConversation.senderName}
-                  className="w-10 h-10 rounded-full mr-3"
-                />
-                <div>
-                  <h3 className="font-medium">{selectedConversation.senderName || selectedConversation.senderPhone}</h3>
-                  <p className="text-sm text-gray-500">
-                    {selectedConversation.contactInfo?.status || "Sin estado"}
-                  </p>
+            <div className="p-4 border-b bg-white shadow-sm">
+              <div className="flex items-center justify-between">
+                <div className="flex items-center space-x-3">
+                  {selectedConversation.senderImage ? (
+                    <img 
+                      src={selectedConversation.senderImage} 
+                      alt={selectedConversation.senderName || selectedConversation.senderPhone}
+                      className="w-10 h-10 rounded-full object-cover ring-2 ring-blue-500"
+                    />
+                  ) : (
+                    <div className="w-10 h-10 rounded-full bg-gradient-to-br from-blue-400 to-blue-600 flex items-center justify-center ring-2 ring-blue-500">
+                      <span className="text-white font-semibold">
+                        {(selectedConversation.senderName || selectedConversation.senderPhone).charAt(0).toUpperCase()}
+                      </span>
+                    </div>
+                  )}
+                  <div>
+                    <h2 className="text-lg font-semibold text-gray-900">
+                      {selectedConversation.senderName || selectedConversation.senderPhone}
+                    </h2>
+                    <p className="text-sm text-gray-500">
+                      {selectedConversation.aiEnabled ? "Asistente IA activo" : "Asistente IA inactivo"}
+                    </p>
+                  </div>
                 </div>
+                <button
+                  onClick={() => {
+                    const newValue = !selectedConversation.aiEnabled
+                    axios.post(`/api/conversations/${selectedConversation.id}/toggle-ai`, {
+                      aiEnabled: newValue
+                    }).then(() => {
+                      updateConversation(selectedConversation.id)
+                    })
+                  }}
+                  className={`px-4 py-2 rounded-full text-sm font-medium transition-colors duration-200 ${
+                    selectedConversation.aiEnabled
+                      ? "bg-green-500 hover:bg-green-600 text-white"
+                      : "bg-gray-200 hover:bg-gray-300 text-gray-700"
+                  }`}
+                >
+                  {selectedConversation.aiEnabled ? "IA Activada" : "IA Desactivada"}
+                </button>
               </div>
             </div>
-
             <div 
               ref={chatContainerRef}
-              className="flex-1 overflow-y-auto p-4 bg-gray-50 scrollbar-thin scrollbar-thumb-gray-300 scrollbar-track-transparent"
+              className="flex-1 overflow-y-auto p-4 space-y-4"
               style={{ scrollBehavior: "smooth" }}
             >
               {selectedConversation.messages.map((msg, index) => (
                 <div
                   key={index}
-                  className={`mb-4 flex ${
+                  className={`flex ${
                     msg.direction === "out" ? "justify-end" : "justify-start"
                   }`}
                 >
                   <div
-                    className={`max-w-[70%] rounded-lg p-3 ${
+                    className={`max-w-[70%] rounded-2xl p-3 ${
                       msg.direction === "out"
-                        ? "bg-blue-500 text-white"
-                        : "bg-white text-gray-800"
+                        ? "bg-gradient-to-r from-blue-500 to-blue-600 text-white"
+                        : "bg-white text-gray-800 shadow-sm"
                     }`}
                   >
+                    {msg.imageUrl && (
+                      <img 
+                        src={msg.imageUrl} 
+                        alt="Imagen" 
+                        className="max-w-full rounded-lg mb-2"
+                      />
+                    )}
                     <p className="whitespace-pre-wrap break-words">{msg.content}</p>
-                    <p className="text-xs mt-1 opacity-70">
+                    <p className={`text-xs mt-1 ${msg.direction === "out" ? "text-blue-100" : "text-gray-500"}`}>
                       {new Date(msg.timestamp).toLocaleTimeString()}
+                      {msg.isAI && (
+                        <span className="ml-2 px-2 py-0.5 bg-blue-500 rounded-full text-white">
+                          IA
+                        </span>
+                      )}
                     </p>
                   </div>
                 </div>
               ))}
               <div ref={messagesEndRef} />
             </div>
-
-            <div className="p-4 border-t bg-white">
-              <div className="flex">
+            <div className="p-4 border-t bg-white shadow-lg">
+              <div className="flex space-x-2">
                 <input
                   type="text"
                   value={message}
                   onChange={(e) => setMessage(e.target.value)}
                   onKeyPress={(e) => e.key === "Enter" && sendMessage()}
                   placeholder="Escribe un mensaje..."
-                  className="flex-1 border rounded-l-lg px-4 py-2 focus:outline-none focus:border-blue-500"
+                  className="flex-1 border rounded-full px-6 py-3 focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent"
                 />
                 <button
                   onClick={sendMessage}
-                  className="bg-blue-500 text-white px-6 py-2 rounded-r-lg hover:bg-blue-600"
+                  className="bg-gradient-to-r from-blue-500 to-blue-600 text-white px-6 py-3 rounded-full hover:from-blue-600 hover:to-blue-700 transition-colors duration-200 flex items-center space-x-2"
                 >
-                  Enviar
+                  <span>Enviar</span>
+                  <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M12 19l9 2-9-18-9 18 9-2zm0 0v-8" />
+                  </svg>
                 </button>
               </div>
             </div>
           </>
         ) : (
           <div className="flex-1 flex items-center justify-center">
-            <p className="text-gray-500">Selecciona una conversación para comenzar</p>
+            <div className="text-center">
+              <svg className="w-16 h-16 mx-auto text-gray-400 mb-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M8 12h.01M12 12h.01M16 12h.01M21 12c0 4.418-4.03 8-9 8a9.863 9.863 0 01-4.255-.949L3 20l1.395-3.72C3.512 15.042 3 13.574 3 12c0-4.418 4.03-8 9-8s9 3.582 9 8z" />
+              </svg>
+              <p className="text-gray-500 text-lg">Selecciona una conversación para comenzar</p>
+            </div>
           </div>
         )}
       </div>
