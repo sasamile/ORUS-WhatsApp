@@ -6,9 +6,10 @@ export async function GET(
   { params }: { params: { id: string } }
 ) {
   try {
-    console.log("Obteniendo conversación con ID:", params.id)
+    const id = params.id
+    console.log("Obteniendo conversación con ID:", id)
 
-    if (!params.id) {
+    if (!id) {
       return NextResponse.json(
         { error: "ID de conversación no proporcionado" },
         { status: 400 }
@@ -16,14 +17,14 @@ export async function GET(
     }
 
     const conversation = await prisma.conversation.findUnique({
-      where: { id: params.id },
+      where: { id },
       include: {
         company: true
       }
     })
 
     if (!conversation) {
-      console.log("Conversación no encontrada para ID:", params.id)
+      console.log("Conversación no encontrada para ID:", id)
       return NextResponse.json(
         { error: "Conversación no encontrada" },
         { status: 404 }

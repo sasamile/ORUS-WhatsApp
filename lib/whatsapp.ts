@@ -350,67 +350,46 @@ class WhatsAppService {
     }
   }
 
-  async sendMessage(companyId: string, to: string, message: string) {
+  async sendMessage(companyId: string, to: string, message: string, isAIResponse: boolean = false): Promise<boolean> {
     try {
       console.log(`Iniciando envío de mensaje desde ${companyId} a ${to}: ${message}`)
       
+      // Verificar si WhatsApp está conectado
+      const status = await this.getStatus(companyId)
+      if (!status.connected) {
+        console.log(`WhatsApp no está conectado para ${companyId}, intentando reconectar...`)
+        await this.initialize(companyId)
+        
+        // Verificar nuevamente después de intentar reconectar
+        const newStatus = await this.getStatus(companyId)
+        if (!newStatus.connected) {
+          throw new Error(`No se pudo conectar WhatsApp para la compañía ${companyId}`)
+        }
+      }
+
       const socket = this.sessions.get(companyId)
-      const isConnected = this.connectionStates.get(companyId)
-      
-      if (!socket || !isConnected) {
-        console.error(`WhatsApp no está conectado para la compañía ${companyId}`)
-        throw new Error(`WhatsApp no está conectado para la compañía ${companyId}`)
+      if (!socket) {
+        throw new Error(`No se encontró el socket para la compañía ${companyId}`)
       }
 
       // Asegurarse de que el número tenga el formato correcto
-      const formattedNumber = to.includes('@s.whatsapp.net') ? to : `${to}@s.whatsapp.net`
+      const formattedNumber = to.replace(/\D/g, '')
+      if (!formattedNumber) {
+        throw new Error('Número de teléfono inválido')
+      }
+
+      const jid = `${formattedNumber}@s.whatsapp.net`
+      console.log(`Enviando mensaje a ${jid}`)
+
+      await socket.sendMessage(jid, { text: message })
+      console.log(`Mensaje enviado exitosamente a WhatsApp, ID: ${Date.now().toString(16)}`)
+
+      // Solo guardar el mensaje si no es una respuesta de IA
+      if (!isAIResponse) {
+        await this.saveOutgoingMessage(companyId, to, message)
+      }
       
-      console.log(`Enviando mensaje a ${formattedNumber}`)
-      const sentMessage = await socket.sendMessage(formattedNumber, { text: message })
-      
-      if (!sentMessage || !sentMessage.key || !sentMessage.key.id) {
-        throw new Error('No se pudo enviar el mensaje a WhatsApp')
-      }
-
-      console.log(`Mensaje enviado exitosamente a WhatsApp, ID: ${sentMessage.key.id}`)
-      
-      const phoneNumber = this.phoneNumbers.get(companyId)
-      if (!phoneNumber) {
-        throw new Error('No se encontró el número de teléfono de la compañía')
-      }
-
-      // Guardar el mensaje en la base de datos
-      const savedConversation = await this.saveOutgoingMessage(
-        companyId,
-        to,
-        message,
-        sentMessage.key.id
-      )
-
-      if (!savedConversation) {
-        throw new Error('No se pudo guardar el mensaje en la base de datos')
-      }
-
-      console.log(`Mensaje guardado exitosamente en la base de datos`)
-      
-      // Emitir evento de nuevo mensaje
-      if (savedConversation.messages && Array.isArray(savedConversation.messages)) {
-        const lastMessage = savedConversation.messages[savedConversation.messages.length - 1]
-        broadcast({
-          type: "new_message",
-          data: {
-            companyId,
-            conversationId: savedConversation.id,
-            message: lastMessage
-          }
-        })
-      }
-
-      return {
-        success: true,
-        conversationId: savedConversation.id,
-        messageId: sentMessage.key.id
-      }
+      return true
     } catch (error) {
       console.error(`Error enviando mensaje desde ${companyId}:`, error)
       throw error
@@ -547,7 +526,7 @@ class WhatsAppService {
     }
   }
 
-  private async handleIncomingMessage(companyId: string, m: any) {
+  async handleIncomingMessage(companyId: string, m: any) {
     try {
       const msg = m.messages[0]
       if (!msg.message) {
@@ -585,23 +564,23 @@ class WhatsAppService {
       // Obtener información del contacto
       const socket = this.sessions.get(companyId)
       if (socket) {
-      try {
-          const contact = await socket.fetchStatus(msg.key.remoteJid)
-        senderName = contact?.status || from
-        
         try {
+          const contact = await socket.fetchStatus(msg.key.remoteJid)
+          senderName = contact?.status || from
+          
+          try {
             const profilePicture = await socket.profilePictureUrl(msg.key.remoteJid)
-          if (profilePicture) {
-            const response = await fetch(profilePicture)
-            const buffer = await response.arrayBuffer()
-            senderImage = `data:image/jpeg;base64,${Buffer.from(buffer).toString('base64')}`
+            if (profilePicture) {
+              const response = await fetch(profilePicture)
+              const buffer = await response.arrayBuffer()
+              senderImage = `data:image/jpeg;base64,${Buffer.from(buffer).toString('base64')}`
+            }
+          } catch (error) {
+            console.log(`No se pudo obtener la imagen del perfil para ${companyId}:`, error)
           }
         } catch (error) {
-            console.log(`No se pudo obtener la imagen del perfil para ${companyId}:`, error)
-        }
-      } catch (error) {
           console.log(`No se pudo obtener la información del contacto para ${companyId}:`, error)
-        senderName = from
+          senderName = from
         }
       }
 
@@ -609,12 +588,12 @@ class WhatsAppService {
       if (msg.message.imageMessage) {
         text = msg.message.imageMessage.caption || ""
         if (socket) {
-        try {
+          try {
             const stream = await socket.downloadMediaMessage(msg)
-          const buffer = Buffer.from(await stream.arrayBuffer())
-          imageUrl = `data:image/jpeg;base64,${buffer.toString('base64')}`
+            const buffer = Buffer.from(await stream.arrayBuffer())
+            imageUrl = `data:image/jpeg;base64,${buffer.toString('base64')}`
             console.log(`Imagen del mensaje descargada para ${companyId}`)
-        } catch (error) {
+          } catch (error) {
             console.error(`Error descargando imagen para ${companyId}:`, error)
           }
         }
@@ -636,47 +615,126 @@ class WhatsAppService {
 
       if (phoneNumber) {
         console.log(`Guardando mensaje para ${companyId} de ${from}:`, { text, imageUrl })
-        const conversation = await this.saveIncomingMessage(
+        
+        // Verificar si el mensaje ya existe en la conversación
+        const conversation = await prisma.conversation.findFirst({
+          where: {
+            companyId,
+            senderPhone: from
+          }
+        })
+
+        if (conversation) {
+          const messages = Array.isArray(conversation.messages) ? conversation.messages : []
+          const messageExists = messages.some((existingMsg: any) => 
+            existingMsg.messageId === msg.key.id || 
+            (existingMsg.content === text && 
+             existingMsg.direction === (msg.key.fromMe ? "out" : "in") &&
+             new Date().getTime() - new Date(existingMsg.timestamp).getTime() < 5000)
+          )
+
+          if (messageExists) {
+            console.log(`Mensaje duplicado detectado para ${companyId}, ignorando...`)
+            return
+          }
+        }
+
+        const savedConversation = await this.saveIncomingMessage(
           companyId,
-        from,
-        text,
+          from,
+          text,
           imageUrl,
           senderName,
           senderImage,
           msg.key.id,
           msg.key.fromMe
         )
-        
-        if (conversation) {
-          console.log(`Conversación guardada exitosamente para ${companyId}:`, conversation.id)
+
+        if (savedConversation) {
+          console.log(`Conversación guardada exitosamente para ${companyId}:`, savedConversation.id)
+          console.log(`Estado de IA para la conversación:`, savedConversation.aiEnabled)
           
           // Emitir evento de nuevo mensaje a través de WebSocket
-          if (Array.isArray(conversation.messages) && conversation.messages.length > 0) {
+          if (Array.isArray(savedConversation.messages) && savedConversation.messages.length > 0) {
             broadcast({
               type: "new_message",
               data: {
                 companyId,
-                conversationId: conversation.id,
-                message: conversation.messages[conversation.messages.length - 1]
+                conversationId: savedConversation.id,
+                message: savedConversation.messages[savedConversation.messages.length - 1]
               }
             })
-        }
+          }
 
-        // Marcar mensaje como leído si es entrante
+          // Marcar mensaje como leído si es entrante
           if (!msg.key.fromMe && socket) {
-          try {
+            try {
               await socket.readMessages([msg.key])
               console.log(`Mensaje marcado como leído para ${companyId}`)
-          } catch (error) {
+            } catch (error) {
               console.error(`Error marcando mensaje como leído para ${companyId}:`, error)
+            }
           }
-        }
 
-        // Verificar respuesta de IA solo para mensajes entrantes
-        if (!msg.key.fromMe) {
-            await this.handleAIResponse(companyId, from, text)
+          // Verificar respuesta de IA solo para mensajes entrantes y si está habilitada
+          if (!msg.key.fromMe && savedConversation.aiEnabled) {
+            try {
+              console.log(`Solicitando respuesta de IA para ${companyId} en conversación ${savedConversation.id}`)
+              
+              // Verificar si el mensaje ya fue procesado por la IA
+              const lastMessage = Array.isArray(savedConversation.messages) ? 
+                savedConversation.messages[savedConversation.messages.length - 1] : null;
+              
+              if (lastMessage && 
+                  typeof lastMessage === 'object' && 
+                  'isAI' in lastMessage && 
+                  'content' in lastMessage && 
+                  lastMessage.isAI && 
+                  lastMessage.content === text) {
+                console.log(`Mensaje ya procesado por IA, ignorando...`);
+                return;
+              }
+
+              const response = await fetch(`${process.env.NEXT_PUBLIC_APP_URL}/api/ai/respond`, {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({
+                  conversationId: savedConversation.id,
+                  message: text,
+                  senderPhone: from
+                })
+              })
+
+              if (!response.ok) {
+                const errorText = await response.text()
+                console.error(`Error al obtener respuesta de IA para ${companyId}:`, errorText)
+                throw new Error(`Error en respuesta de IA: ${errorText}`)
+              }
+
+              const result = await response.json()
+              console.log(`Respuesta de IA recibida para ${companyId}:`, result)
+
+              if (!result.success) {
+                throw new Error(`Error en respuesta de IA: ${result.error || 'Error desconocido'}`)
+              }
+
+            } catch (error) {
+              console.error(`Error manejando respuesta de IA para ${companyId}:`, error)
+              // Intentar enviar un mensaje de error al usuario
+              try {
+                await this.sendMessage(
+                  companyId,
+                  from,
+                  "Lo siento, hubo un error procesando tu mensaje. Por favor, intenta nuevamente."
+                )
+              } catch (sendError) {
+                console.error(`Error enviando mensaje de error:`, sendError)
+              }
+            }
+          } else {
+            console.log(`IA no activada para la conversación ${savedConversation.id}`)
           }
-      } else {
+        } else {
           console.error(`Error guardando conversación para ${companyId}`)
         }
       } else {
@@ -713,7 +771,7 @@ class WhatsAppService {
         if (!company) {
         console.error(`No se encontró la compañía con el número: ${phoneNumber}`)
         return null
-      }
+        }
 
       console.log(`Compañía encontrada para ${companyId}:`, company.id)
 
@@ -794,10 +852,10 @@ class WhatsAppService {
     } catch (error) {
       console.error(`Error guardando mensaje entrante para ${companyId}:`, error)
         return null
-    }
+      }
   }
 
-  private async saveOutgoingMessage(companyId: string, to: string, message: string, messageId: string) {
+  private async saveOutgoingMessage(companyId: string, to: string, message: string) {
     try {
       console.log(`Guardando mensaje saliente para ${companyId} a ${to}`)
       
@@ -822,7 +880,7 @@ class WhatsAppService {
         timestamp: new Date().toISOString(),
         isAI: false,
         imageUrl: null,
-        messageId,
+        messageId: Date.now().toString(16),
         read: true
       }
 
@@ -855,7 +913,7 @@ class WhatsAppService {
         console.log(`Actualizando conversación existente:`, conversation.id)
         const currentMessages = Array.isArray(conversation.messages) ? conversation.messages : []
         const messageExists = currentMessages.some((msg: any) => 
-          msg.messageId === messageId || 
+          msg.messageId === newMessage.messageId || 
           (msg.timestamp === newMessage.timestamp && msg.content === newMessage.content)
         )
 

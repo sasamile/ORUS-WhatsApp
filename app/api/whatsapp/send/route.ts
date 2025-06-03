@@ -7,7 +7,7 @@ export async function POST(request: NextRequest) {
     const body = await request.json()
     console.log("Recibiendo petición de envío:", body)
 
-    const { to, message, companyId } = body
+    const { to, message, companyId, messageId } = body
 
     // Validación de datos
     if (!to || typeof to !== 'string') {
@@ -68,23 +68,79 @@ export async function POST(request: NextRequest) {
       )
     }
 
-    // Enviar mensaje
-    console.log("Intentando enviar mensaje:", { to, message, companyId })
-    const result = await whatsappService.sendMessage(companyId, to, message)
-    console.log("Resultado del envío:", result)
+    // Buscar la conversación existente
+    const conversation = await prisma.conversation.findFirst({
+      where: {
+        companyId,
+        senderPhone: to
+      }
+    })
 
-    if (!result.success) {
+    if (!conversation) {
+      console.error("No se encontró la conversación")
       return NextResponse.json(
-        { error: "No se pudo enviar el mensaje" },
-        { status: 500 }
+        { error: "No se encontró la conversación" },
+        { status: 400 }
       )
     }
 
-    return NextResponse.json({
-      success: true,
-      message: "Mensaje enviado exitosamente",
-      conversationId: result.conversationId
+    // Verificar si el mensaje ya existe usando una transacción
+    const result = await prisma.$transaction(async (tx) => {
+      const currentConversation = await tx.conversation.findUnique({
+        where: { id: conversation.id },
+        select: { messages: true }
+      })
+
+      if (!currentConversation) {
+        throw new Error("Conversación no encontrada")
+      }
+
+      const messages = Array.isArray(currentConversation.messages) ? currentConversation.messages : []
+      const messageExists = messages.some((msg: any) => 
+        msg.messageId === messageId || 
+        (msg.content === message && 
+         msg.direction === "out" &&
+         new Date().getTime() - new Date(msg.timestamp).getTime() < 5000)
+      )
+
+      if (messageExists) {
+        console.log("Mensaje duplicado detectado, ignorando...")
+        return { success: true, message: "Mensaje ya enviado" }
+      }
+
+      // Enviar mensaje
+      console.log("Intentando enviar mensaje:", { to, message, companyId, messageId })
+      const sendResult = await whatsappService.sendMessage(companyId, to, message)
+      console.log("Resultado del envío:", sendResult)
+
+      if (!sendResult) {
+        throw new Error("No se pudo enviar el mensaje")
+      }
+
+      // Crear el nuevo mensaje
+      const newMessage = {
+        content: message,
+        direction: "out",
+        timestamp: new Date().toISOString(),
+        isAI: false,
+        imageUrl: null,
+        messageId: messageId,
+        read: true
+      }
+
+      // Actualizar la conversación con el nuevo mensaje
+      const updatedConversation = await tx.conversation.update({
+        where: { id: conversation.id },
+        data: {
+          messages: [...messages, newMessage],
+          lastUpdated: new Date()
+        }
+      })
+
+      return { success: true, message: "Mensaje enviado exitosamente", conversation: updatedConversation }
     })
+
+    return NextResponse.json(result)
   } catch (error: any) {
     console.error("Error enviando mensaje:", error)
     return NextResponse.json(

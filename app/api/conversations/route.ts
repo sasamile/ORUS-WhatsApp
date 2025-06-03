@@ -11,7 +11,7 @@ export async function GET(req: Request) {
         { error: "Se requiere el ID de la compañía" },
         { status: 400 }
       )
-    }
+      }
 
     console.log(`Buscando conversaciones para companyId: ${companyId}`)
 

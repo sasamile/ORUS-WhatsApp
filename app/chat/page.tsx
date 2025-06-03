@@ -10,6 +10,7 @@ interface Message {
   timestamp: string
   isAI: boolean
   imageUrl?: string | null
+  messageId: string
 }
 
 interface Conversation {
@@ -38,6 +39,7 @@ export default function ChatPage() {
   const [isRedirecting, setIsRedirecting] = useState(false)
   const [phoneNumber, setPhoneNumber] = useState<string | null>(null)
   const [isConnected, setIsConnected] = useState(false)
+  const [isReconnecting, setIsReconnecting] = useState(false)
 
   // Referencias para el contenedor de mensajes
   const messagesEndRef = useRef<HTMLDivElement>(null)
@@ -45,6 +47,7 @@ export default function ChatPage() {
   const prevMessagesLengthRef = useRef<number>(0)
   const wsRef = useRef<WebSocket | null>(null)
   const reconnectTimeoutRef = useRef<NodeJS.Timeout | undefined>(undefined)
+  const heartbeatIntervalRef = useRef<NodeJS.Timeout | null>(null)
 
   // Función para verificar si el usuario está al final del chat
   const isAtBottom = () => {
@@ -89,7 +92,7 @@ export default function ChatPage() {
       console.log("Verificando estado de WhatsApp para companyId:", companyId)
       const status = await axios.get("/api/whatsapp/status", { params: { companyId } }).then(res => res.data)
       console.log('Estado de WhatsApp:', status)
-      
+            
       if (!status.connected) {
         console.log('WhatsApp no está conectado, intentando reconectar...')
         const reconnectResult = await axios.post("/api/whatsapp/connect", { companyId }).then(res => res.data)
@@ -99,10 +102,19 @@ export default function ChatPage() {
           setError('No se pudo conectar con WhatsApp. Por favor, intente nuevamente.')
           return false
         }
+
+        // Establecer el número de teléfono después de la reconexión
+        if (reconnectResult.phoneNumber) {
+          setPhoneNumber(reconnectResult.phoneNumber)
+        }
+      } else {
+        // Establecer el número de teléfono del estado actual
+        if (status.phoneNumber) {
+          setPhoneNumber(status.phoneNumber)
+        }
       }
       
       setIsConnected(true)
-      setPhoneNumber(status.phoneNumber)
       await loadConversations()
       return true
     } catch (error) {
@@ -112,8 +124,65 @@ export default function ChatPage() {
     }
   }
 
+  const startHeartbeat = () => {
+    if (heartbeatIntervalRef.current) {
+      clearInterval(heartbeatIntervalRef.current)
+    }
+
+    heartbeatIntervalRef.current = setInterval(async () => {
+      try {
+        const companyId = localStorage.getItem('companyId')
+        if (!companyId) return
+
+        const status = await axios.get("/api/whatsapp/status", { params: { companyId } }).then(res => res.data)
+        
+        if (!status.connected && !isReconnecting) {
+          console.log('Conexión perdida, reconectando...')
+          await reconnectWhatsApp()
+        }
+      } catch (error) {
+        console.error('Error en heartbeat:', error)
+      }
+    }, 30000) // Cada 30 segundos
+  }
+
+  const reconnectWhatsApp = async () => {
+    if (isReconnecting) return
+    
+    setIsReconnecting(true)
+    try {
+      const companyId = localStorage.getItem('companyId')
+      if (!companyId) return
+
+      console.log('Iniciando reconexión de WhatsApp...')
+      const reconnectResult = await axios.post("/api/whatsapp/connect", { companyId }).then(res => res.data)
+      
+      if (reconnectResult.connected) {
+        console.log('Reconexión exitosa')
+        setIsConnected(true)
+      } else {
+        console.error('Fallo en reconexión')
+        // Intentar nuevamente en 5 segundos
+        setTimeout(reconnectWhatsApp, 5000)
+      }
+    } catch (error) {
+      console.error('Error en reconexión:', error)
+      // Intentar nuevamente en 5 segundos
+      setTimeout(reconnectWhatsApp, 5000)
+    } finally {
+      setIsReconnecting(false)
+    }
+  }
+
   useEffect(() => {
     checkWhatsAppStatus()
+    startHeartbeat()
+
+    return () => {
+      if (heartbeatIntervalRef.current) {
+        clearInterval(heartbeatIntervalRef.current)
+      }
+    }
   }, [router])
 
   const loadConversations = async () => {
@@ -155,7 +224,7 @@ export default function ChatPage() {
       setError("Error al cargar las conversaciones")
       setConversations([]) // Asegurar que conversations sea un array vacío en caso de error
       setIsLoading(false)
-    }
+        }
   }
 
   const handleConnectClick = () => {
@@ -177,51 +246,63 @@ export default function ChatPage() {
     }
 
     try {
-      // Verificar que el número de teléfono exista
       if (!selectedConversation.senderPhone) {
         setError('Número de teléfono no disponible')
         return
       }
 
-      // Asegurar que el número de teléfono tenga el formato correcto
       const phoneNumber = selectedConversation.senderPhone.replace(/\D/g, '')
       if (!phoneNumber) {
         setError('Número de teléfono inválido')
         return
       }
 
-      // Verificar estado de WhatsApp
+      // Verificar y mantener conexión
       const status = await axios.get("/api/whatsapp/status", { params: { companyId } }).then(res => res.data)
-      console.log('Estado de WhatsApp:', status)
-
+      
       if (!status.connected) {
-        console.log('WhatsApp no está conectado, intentando reconectar...')
-        const reconnectResult = await axios.post("/api/whatsapp/connect", { companyId }).then(res => res.data)
-        console.log('Resultado de reconexión:', reconnectResult)
-        
-        if (!reconnectResult.connected) {
-          setError('No se pudo conectar con WhatsApp. Por favor, intente nuevamente.')
-          return
+        console.log('WhatsApp desconectado, intentando reconectar...')
+        await reconnectWhatsApp()
+        // Verificar nuevamente después de la reconexión
+        const newStatus = await axios.get("/api/whatsapp/status", { params: { companyId } }).then(res => res.data)
+        if (!newStatus.connected) {
+          throw new Error('No se pudo reconectar WhatsApp')
         }
       }
 
-      // Enviar mensaje a través del endpoint de WhatsApp
       const messageData = {
         to: phoneNumber,
         message: message.trim(),
         companyId
       }
 
-      console.log('Enviando mensaje:', messageData)
-      const response = await axios.post('/api/whatsapp/send', messageData)
-      
-      if (response.data.success) {
-        setMessage('')
-        // Actualizar la conversación después de enviar el mensaje
-        await updateConversation(selectedConversation.id)
-      } else {
-        setError('Error al enviar el mensaje')
+      // Sistema de reintentos para el envío
+      let retries = 3
+      let lastError = null
+
+      while (retries > 0) {
+        try {
+          const response = await axios.post('/api/whatsapp/send', messageData)
+          if (response.data.success) {
+            setMessage('')
+            updateConversation(selectedConversation.id)
+            return
+          }
+        } catch (error) {
+          lastError = error
+          console.log(`Intento fallido (${4-retries}/3):`, error)
+          
+          // Si es error de conexión, intentar reconectar
+          if (axios.isAxiosError(error) && error.response?.status === 400) {
+            await reconnectWhatsApp()
+          }
+          
+          await new Promise(resolve => setTimeout(resolve, 1000))
+          retries--
+        }
       }
+
+      throw lastError || new Error('Error al enviar el mensaje después de varios intentos')
 
     } catch (error) {
       console.error('Error completo:', error)
@@ -249,7 +330,6 @@ export default function ChatPage() {
     try {
       console.log("Solicitando actualización de conversación:", conversationId)
       
-      // Verificar que el ID de la conversación sea válido
       if (!conversationId) {
         console.error("ID de conversación inválido")
         return
@@ -266,30 +346,63 @@ export default function ChatPage() {
       console.log("Conversación actualizada recibida:", updatedConversation)
 
       setConversations(prevConversations => {
-        const newConversations = prevConversations.map(conv => 
-          conv.id === conversationId ? updatedConversation : conv
-        )
-        // Ordenar conversaciones por fecha de último mensaje
+        const newConversations = prevConversations.map(conv => {
+          if (conv.id === conversationId) {
+            // Si es la conversación seleccionada, no mostrar contador de no leídos
+            const unreadCount = selectedConversation?.id === conversationId ? 0 : conv.unreadCount
+            
+            // Verificar si hay mensajes duplicados
+            const currentMessages = conv.messages || []
+            const newMessages = updatedConversation.messages || []
+            
+            const uniqueMessages = newMessages.filter((newMsg: any) => 
+              !currentMessages.some((currentMsg: any) => 
+                (currentMsg.messageId === newMsg.messageId) || 
+                (currentMsg.timestamp === newMsg.timestamp && 
+                 currentMsg.content === newMsg.content &&
+                 currentMsg.direction === newMsg.direction)
+              )
+            )
+            
+            return {
+              ...updatedConversation,
+              unreadCount,
+              messages: [...currentMessages, ...uniqueMessages]
+            }
+          }
+          return conv
+        })
+        
         return newConversations.sort((a, b) => 
           new Date(b.lastUpdated).getTime() - new Date(a.lastUpdated).getTime()
         )
       })
 
-      // Actualizar la conversación seleccionada si es la misma
       if (selectedConversation?.id === conversationId) {
-        console.log("Actualizando conversación seleccionada con nuevos datos")
-        setSelectedConversation(updatedConversation)
+        setSelectedConversation(prev => {
+          if (!prev) return updatedConversation
+          
+          const currentMessages = prev.messages || []
+          const newMessages = updatedConversation.messages || []
+          
+          const uniqueMessages = newMessages.filter((newMsg: any) => 
+            !currentMessages.some((currentMsg: any) => 
+              (currentMsg.messageId === newMsg.messageId) || 
+              (currentMsg.timestamp === newMsg.timestamp && 
+               currentMsg.content === newMsg.content &&
+               currentMsg.direction === newMsg.direction)
+            )
+          )
+          
+          return {
+            ...updatedConversation,
+            unreadCount: 0, // Siempre 0 para la conversación seleccionada
+            messages: [...currentMessages, ...uniqueMessages]
+          }
+        })
       }
     } catch (error) {
       console.error("Error actualizando conversación:", error)
-      if (axios.isAxiosError(error)) {
-        console.error("Detalles del error:", {
-          status: error.response?.status,
-          data: error.response?.data,
-          message: error.message
-        })
-      }
-      // No actualizamos el estado en caso de error para mantener la UI estable
     }
   }
 
@@ -334,7 +447,7 @@ export default function ChatPage() {
   return (
     <div className="flex h-screen bg-gray-100">
       {/* Sidebar */}
-      <div className="w-1/4 bg-white border-r shadow-lg">
+      <div className="w-80 bg-white border-r shadow-lg">
         <div className="p-4 border-b bg-gradient-to-r from-blue-600 to-blue-700 text-white">
           <div className="flex items-center justify-between mb-2">
             <h2 className="text-xl font-semibold">Conversaciones</h2>
@@ -349,24 +462,33 @@ export default function ChatPage() {
                   })
                 }
               }}
-              className={`px-3 py-1 rounded-full text-sm font-medium transition-colors duration-200 ${
+              className={`px-3 py-1 rounded-xl text-sm font-medium transition-all duration-200 ${
                 selectedConversation?.aiEnabled
-                  ? "bg-green-500 hover:bg-green-600"
-                  : "bg-gray-500 hover:bg-gray-600"
+                  ? "bg-green-500 hover:bg-green-600 shadow-lg"
+                  : "bg-gray-500 hover:bg-gray-600 shadow-lg"
               }`}
             >
               {selectedConversation?.aiEnabled ? "IA Activada" : "IA Desactivada"}
             </button>
           </div>
-          <p className="text-sm text-blue-100">Número: {phoneNumber}</p>
+          <div className="flex items-center space-x-2">
+            <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M3 5a2 2 0 012-2h3.28a1 1 0 01.948.684l1.498 4.493a1 1 0 01-.502 1.21l-2.257 1.13a11.042 11.042 0 005.516 5.516l1.13-2.257a1 1 0 011.21-.502l4.493 1.498a1 1 0 01.684.949V19a2 2 0 01-2 2h-1C9.716 21 3 14.284 3 6V5z" />
+            </svg>
+            <p className="text-sm text-blue-100">
+              {phoneNumber ? `Número: ${phoneNumber}` : 'Conectando...'}
+            </p>
+          </div>
         </div>
         <div className="overflow-y-auto h-[calc(100vh-80px)]">
           {Array.isArray(conversations) && conversations.length > 0 ? (
             conversations.map((conversation) => (
               <div
                 key={conversation.id}
-                className={`p-4 border-b cursor-pointer hover:bg-gray-50 transition-colors duration-200 ${
-                  selectedConversation?.id === conversation.id ? "bg-blue-50 border-l-4 border-blue-500" : ""
+                className={`p-4 border-b cursor-pointer transition-all duration-200 hover:bg-gray-50 ${
+                  selectedConversation?.id === conversation.id 
+                    ? "bg-blue-50 border-l-4 border-blue-500 shadow-inner" 
+                    : ""
                 }`}
                 onClick={() => {
                   setSelectedConversation(conversation)
@@ -377,13 +499,13 @@ export default function ChatPage() {
               >
                 <div className="flex items-center space-x-3">
                   {conversation.senderImage ? (
-                    <img 
+                    <img
                       src={conversation.senderImage} 
                       alt={conversation.senderName || conversation.senderPhone}
-                      className="w-12 h-12 rounded-full object-cover ring-2 ring-blue-500"
+                      className="w-12 h-12 rounded-full object-cover ring-2 ring-blue-500 shadow-lg"
                     />
                   ) : (
-                    <div className="w-12 h-12 rounded-full bg-gradient-to-br from-blue-400 to-blue-600 flex items-center justify-center ring-2 ring-blue-500">
+                    <div className="w-12 h-12 rounded-full bg-gradient-to-br from-blue-400 to-blue-600 flex items-center justify-center ring-2 ring-blue-500 shadow-lg">
                       <span className="text-white font-semibold text-lg">
                         {(conversation.senderName || conversation.senderPhone).charAt(0).toUpperCase()}
                       </span>
@@ -396,7 +518,7 @@ export default function ChatPage() {
                           {conversation.senderName || conversation.senderPhone}
                         </p>
                         {conversation.aiEnabled && (
-                          <span className="px-2 py-0.5 bg-green-100 text-green-800 text-xs rounded-full">
+                          <span className="px-2 py-0.5 bg-green-100 text-green-800 text-xs rounded-full shadow-sm">
                             IA
                           </span>
                         )}
@@ -408,8 +530,8 @@ export default function ChatPage() {
                     <p className="text-sm text-gray-500 truncate">
                       {conversation.messages?.[conversation.messages.length - 1]?.content || "Sin mensajes"}
                     </p>
-                    {conversation.unreadCount > 0 && (
-                      <span className="inline-flex items-center justify-center px-2 py-1 text-xs font-bold leading-none text-white transform translate-y-1/2 bg-blue-600 rounded-full">
+                    {conversation.unreadCount > 0 && selectedConversation?.id !== conversation.id && (
+                      <span className="inline-flex items-center justify-center px-2 py-1 text-xs font-bold leading-none text-white transform translate-y-1/2 bg-blue-600 rounded-full shadow-lg">
                         {conversation.unreadCount}
                       </span>
                     )}
@@ -433,18 +555,18 @@ export default function ChatPage() {
       <div className="flex-1 flex flex-col bg-gray-50">
         {selectedConversation ? (
           <>
-            <div className="p-4 border-b bg-white shadow-sm">
+            <div className="p-4 border-b bg-white shadow-lg">
               <div className="flex items-center justify-between">
                 <div className="flex items-center space-x-3">
                   {selectedConversation.senderImage ? (
                     <img 
                       src={selectedConversation.senderImage} 
                       alt={selectedConversation.senderName || selectedConversation.senderPhone}
-                      className="w-10 h-10 rounded-full object-cover ring-2 ring-blue-500"
+                      className="w-12 h-12 rounded-full object-cover ring-2 ring-blue-500 shadow-lg"
                     />
                   ) : (
-                    <div className="w-10 h-10 rounded-full bg-gradient-to-br from-blue-400 to-blue-600 flex items-center justify-center ring-2 ring-blue-500">
-                      <span className="text-white font-semibold">
+                    <div className="w-12 h-12 rounded-full bg-gradient-to-br from-blue-400 to-blue-600 flex items-center justify-center ring-2 ring-blue-500 shadow-lg">
+                      <span className="text-white font-semibold text-lg">
                         {(selectedConversation.senderName || selectedConversation.senderPhone).charAt(0).toUpperCase()}
                       </span>
                     </div>
@@ -467,10 +589,10 @@ export default function ChatPage() {
                       updateConversation(selectedConversation.id)
                     })
                   }}
-                  className={`px-4 py-2 rounded-full text-sm font-medium transition-colors duration-200 ${
+                  className={`px-4 py-2 rounded-xl text-sm font-medium transition-all duration-200 ${
                     selectedConversation.aiEnabled
-                      ? "bg-green-500 hover:bg-green-600 text-white"
-                      : "bg-gray-200 hover:bg-gray-300 text-gray-700"
+                      ? "bg-green-500 hover:bg-green-600 text-white shadow-lg"
+                      : "bg-gray-200 hover:bg-gray-300 text-gray-700 shadow-lg"
                   }`}
                 >
                   {selectedConversation.aiEnabled ? "IA Activada" : "IA Desactivada"}
@@ -490,17 +612,17 @@ export default function ChatPage() {
                   }`}
                 >
                   <div
-                    className={`max-w-[70%] rounded-2xl p-3 ${
+                    className={`max-w-[70%] rounded-2xl p-3 shadow-lg ${
                       msg.direction === "out"
                         ? "bg-gradient-to-r from-blue-500 to-blue-600 text-white"
-                        : "bg-white text-gray-800 shadow-sm"
+                        : "bg-white text-gray-800"
                     }`}
                   >
                     {msg.imageUrl && (
                       <img 
                         src={msg.imageUrl} 
                         alt="Imagen" 
-                        className="max-w-full rounded-lg mb-2"
+                        className="max-w-full rounded-lg mb-2 shadow-md"
                       />
                     )}
                     <p className="whitespace-pre-wrap break-words">{msg.content}</p>
@@ -525,11 +647,11 @@ export default function ChatPage() {
                   onChange={(e) => setMessage(e.target.value)}
                   onKeyPress={(e) => e.key === "Enter" && sendMessage()}
                   placeholder="Escribe un mensaje..."
-                  className="flex-1 border rounded-full px-6 py-3 focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent"
+                  className="flex-1 border rounded-xl px-6 py-3 focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent shadow-sm"
                 />
                 <button
                   onClick={sendMessage}
-                  className="bg-gradient-to-r from-blue-500 to-blue-600 text-white px-6 py-3 rounded-full hover:from-blue-600 hover:to-blue-700 transition-colors duration-200 flex items-center space-x-2"
+                  className="bg-gradient-to-r from-blue-500 to-blue-600 text-white px-6 py-3 rounded-xl hover:from-blue-600 hover:to-blue-700 transition-all duration-200 flex items-center space-x-2 shadow-lg"
                 >
                   <span>Enviar</span>
                   <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
